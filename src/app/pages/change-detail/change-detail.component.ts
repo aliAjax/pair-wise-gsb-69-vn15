@@ -20,17 +20,29 @@ import {
   ChangeStep,
   DeviationRecord,
   PHASE_LABELS,
+  PlanVersion,
   RESOURCE_LABELS,
   RISK_LABELS,
   STAGE_LABELS,
   STATUS_LABELS,
+  VERSION_STATE_LABELS,
+  VersionDiff,
+  diffVersions,
+  getCurrentVersion,
   validateChange,
 } from '../../models/change-request.model';
 import { ChangeRequestService } from '../../services/change-request.service';
 import { ChangeRequestActions } from '../../store/change-request.actions';
 import { selectAllChanges } from '../../store/change-request.selectors';
 
-type DetailTab = 'overview' | 'dependency' | 'window' | 'execution' | 'approval' | 'audit';
+type DetailTab =
+  | 'overview'
+  | 'dependency'
+  | 'window'
+  | 'execution'
+  | 'approval'
+  | 'versions'
+  | 'audit';
 
 @Component({
   selector: 'app-change-detail',
@@ -57,8 +69,29 @@ type DetailTab = 'overview' | 'dependency' | 'window' | 'execution' | 'approval'
               <h1>{{ item.title }}</h1>
             </div>
             <span class="status" [class]="item.status">{{ statusLabel(item.status) }}</span>
+            @if (currentVersionRecord(); as version) {
+              <span
+                class="version-badge"
+                [class.invalidated]="version.state === 'invalidated'"
+              >
+                第 {{ version.version }} 版 · {{ versionStateLabel(version.state) }}
+              </span>
+            } @else if (item.versions.length) {
+              <span class="version-badge invalidated">
+                共 {{ item.versions.length }} 版 · 当前签字已失效
+              </span>
+            }
           </div>
           <p>{{ item.summary || '尚未填写变更摘要。' }}</p>
+          @if (item.status === 'resubmit') {
+            <div class="invalidation-banner">
+              <strong>原会签签字已失效</strong>
+              <p>
+                工程师修改了参与对象、窗口或步骤摘要，旧版本签字不再有效。请核对当前方案后重新提交，
+                网络、系统、安全、业务意见将按新版本全部重走。
+              </p>
+            </div>
+          }
         </div>
         <div class="heading-meta">
           <div>
@@ -104,13 +137,19 @@ type DetailTab = 'overview' | 'dependency' | 'window' | 'execution' | 'approval'
                   class="btn btn-sm"
                   type="button"
                   (click)="editing() ? cancelEdit() : beginEdit()"
-                  [disabled]="item.status === 'executing' || item.status === 'completed'"
+                  [disabled]="item.status === 'executing' || item.status === 'completed' || item.status === 'rolled_back'"
                 >
                   {{ editing() ? '取消编辑' : '编辑方案' }}
                 </button>
               </div>
 
               @if (editing()) {
+                @if (currentVersionRecord()) {
+                  <div class="edit-warning">
+                    修改机柜/依赖、窗口或执行/回滚步骤后，当前版本的全部签字将立即失效，
+                    方案回到“待重新提交”，四方意见按新版本重走；仅改标题、风险或值守人员不影响签字。
+                  </div>
+                }
                 <div class="edit-form">
                   <clr-input-container>
                     <label>标题</label>
@@ -258,16 +297,27 @@ type DetailTab = 'overview' | 'dependency' | 'window' | 'execution' | 'approval'
               <div class="surface-heading">
                 <div>
                   <h2>执行步骤</h2>
-                  <span>执行中可逐项勾选，所有操作保留时间戳</span>
+                  <span>
+                    @if (currentVersionRecord(); as version) {
+                      只读第 {{ version.version }} 版冻结快照，逐项勾选保留时间戳
+                    } @else {
+                      没有当前有效版本，失效版本不能勾选执行
+                    }
+                  </span>
                 </div>
                 @if (item.status === 'approved') {
                   <button class="btn btn-primary" type="button" (click)="startExecution()">
-                    开始执行
+                    按第 {{ item.currentVersion }} 版开始执行
                   </button>
                 }
               </div>
+              @if (item.status === 'resubmit') {
+                <div class="invalidation-banner compact">
+                  执行依据的版本已失效，须先在“审批会签”中重新提交并完成会签。
+                </div>
+              }
               <div class="step-list">
-                @for (step of stepsBy(item); track step.id) {
+                @for (step of executionSteps(); track step.id) {
                   <label class="step-row" [class.completed]="step.completed">
                     <input
                       type="checkbox"
@@ -283,7 +333,9 @@ type DetailTab = 'overview' | 'dependency' | 'window' | 'execution' | 'approval'
                     <span>{{ step.owner || '未指定' }}</span>
                   </label>
                 } @empty {
-                  <p class="empty">没有执行步骤。</p>
+                  <p class="empty">
+                    {{ currentVersionRecord() ? '当前版本没有执行步骤。' : '没有可执行的有效版本。' }}
+                  </p>
                 }
               </div>
             </section>
@@ -357,19 +409,30 @@ type DetailTab = 'overview' | 'dependency' | 'window' | 'execution' | 'approval'
               <div class="surface-heading">
                 <div>
                   <h2>顺序会签</h2>
-                  <span>必须按网络、系统、安全、业务顺序完成</span>
+                  <span>
+                    @if (currentVersionRecord(); as version) {
+                      第 {{ version.version }} 版 · 必须按网络、系统、安全、业务顺序完成
+                    } @else {
+                      历史签字已随旧版本失效，需重新提交
+                    }
+                  </span>
                 </div>
-                @if (item.status === 'draft' || item.status === 'rejected') {
+                @if (item.status === 'draft' || item.status === 'rejected' || item.status === 'resubmit') {
                   <button
                     class="btn btn-primary"
                     type="button"
                     (click)="submitForReview()"
-                    [disabled]="hasBlockers()"
+                    [disabled]="!canResubmit()"
                   >
-                    提交审批
+                    {{ item.status === 'draft' ? '提交审批' : '重新提交新版本' }}
                   </button>
                 }
               </div>
+              @if (item.status === 'resubmit') {
+                <div class="invalidation-banner compact">
+                  参与对象、窗口或步骤已变更，下列签字全部失效；重新提交后网络、系统、安全、业务按新版本重走。
+                </div>
+              }
               <ol class="approval-flow">
                 @for (approval of item.approvals; track approval.stage) {
                   <li [ngClass]="approval.state">
@@ -394,11 +457,11 @@ type DetailTab = 'overview' | 'dependency' | 'window' | 'execution' | 'approval'
               <div class="surface-heading">
                 <div>
                   <h2>会签操作</h2>
-                  <span>只有当前顺位负责人可以签署</span>
+                  <span>只有当前有效版本的当前顺位负责人可以签署</span>
                 </div>
               </div>
               @if (pendingStage(); as stage) {
-                @if (item.status === 'submitted' || item.status === 'rejected') {
+                @if (item.status === 'submitted') {
                   <div class="approval-form">
                     <clr-input-container>
                       <label>审批人</label>
@@ -427,9 +490,13 @@ type DetailTab = 'overview' | 'dependency' | 'window' | 'execution' | 'approval'
                 } @else {
                   <p class="empty">当前状态不允许审批操作。</p>
                 }
+              } @else if (item.status === 'resubmit' || item.status === 'rejected') {
+                <p class="empty">
+                  {{ item.status === 'resubmit' ? '旧版本已失效，请重新提交后再会签。' : '方案已退回，修改后可重新提交。' }}
+                </p>
               } @else {
                 <p class="approved-message">
-                  会签已完成。开始执行后审批记录自动冻结，不允许修改。
+                  当前版本会签已完成。开始执行后审批记录自动冻结，不允许修改。
                 </p>
               }
             </section>
@@ -438,7 +505,13 @@ type DetailTab = 'overview' | 'dependency' | 'window' | 'execution' | 'approval'
               <div class="surface-heading">
                 <div>
                   <h2>审批冻结快照</h2>
-                  <span>执行与复盘以冻结版本为准</span>
+                  <span>
+                    @if (currentVersionRecord(); as version) {
+                      执行与复盘以第 {{ version.version }} 版冻结内容为准
+                    } @else {
+                      无当前有效版本，失效版本不可执行
+                    }
+                  </span>
                 </div>
               </div>
               <div class="freeze-strip">
@@ -451,6 +524,159 @@ type DetailTab = 'overview' | 'dependency' | 'window' | 'execution' | 'approval'
               </div>
             </section>
           </div>
+        }
+
+        @case ('versions') {
+          <section class="surface version-history">
+            <div class="surface-heading">
+              <div>
+                <h2>送审版本历史</h2>
+                <span>每次送审固定参与对象、窗口和步骤摘要；失效版本的原始意见仍保留可查</span>
+              </div>
+            </div>
+            @if (versionHistory(); as history) {
+              @if (history.length) {
+                <div class="version-layout">
+                <ol class="version-list">
+                  @for (version of history; track version.version) {
+                    <li
+                      [class.active]="selectedVersionRecord()?.version === version.version"
+                      [class.current]="item.currentVersion === version.version"
+                    >
+                      <button type="button" (click)="selectVersion(version.version)">
+                        <div class="version-row-head">
+                          <strong>第 {{ version.version }} 版</strong>
+                          <span class="version-state" [class]="version.state">
+                            {{ versionStateLabel(version.state) }}
+                          </span>
+                        </div>
+                        <small>{{ version.createdAt | date: 'yyyy-MM-dd HH:mm' }} · {{ version.submittedBy }}</small>
+                        @if (item.currentVersion === version.version) {
+                          <em class="current-tag">当前有效版本</em>
+                        }
+                      </button>
+                    </li>
+                  }
+                </ol>
+
+                @if (selectedVersionRecord(); as version) {
+                  <div class="version-detail">
+                    <div class="version-detail-head">
+                      <h3>第 {{ version.version }} 版方案摘要</h3>
+                      <clr-select-container class="compare-select">
+                        <label>与哪一版对比</label>
+                        <select
+                          clrSelect
+                          [ngModel]="compareVersion() ?? 'none'"
+                          (ngModelChange)="setCompareVersion($event)"
+                        >
+                          <option value="none">不对比</option>
+                          @for (other of item.versions; track other.version) {
+                            @if (other.version !== version.version) {
+                              <option [value]="other.version">与第 {{ other.version }} 版对比</option>
+                            }
+                          }
+                        </select>
+                      </clr-select-container>
+                    </div>
+
+                    @if (version.invalidatedReason) {
+                      <div class="invalidation-banner compact">
+                        <strong>{{ version.invalidatedReason }}</strong>
+                        @if (version.invalidatedAt) {
+                          <span>失效时间：{{ version.invalidatedAt | date: 'yyyy-MM-dd HH:mm' }}</span>
+                        }
+                      </div>
+                    }
+
+                    <dl class="version-facts">
+                      <div>
+                        <dt>参与对象</dt>
+                        <dd>
+                          @for (resource of version.resources; track resource.id) {
+                            <span class="chip">{{ resourceLabel(resource.type) }} · {{ resource.name }}</span>
+                          } @empty {
+                            <span>无</span>
+                          }
+                        </dd>
+                      </div>
+                      <div>
+                        <dt>执行窗口</dt>
+                        <dd>
+                          {{ version.window.start | date: 'yyyy-MM-dd HH:mm' }} 至
+                          {{ version.window.end | date: 'yyyy-MM-dd HH:mm' }}
+                          （观察 {{ version.window.observationWindowMinutes }} 分钟）
+                        </dd>
+                      </div>
+                      <div>
+                        <dt>步骤摘要</dt>
+                        <dd>
+                          <ol class="version-steps">
+                            @for (step of version.steps; track step.id) {
+                              <li>
+                                <span class="phase">{{ phaseLabel(step.phase) }}</span>
+                                {{ step.title }}
+                                <small>{{ step.owner || '未指定责任人' }}</small>
+                              </li>
+                            } @empty {
+                              <li>无</li>
+                            }
+                          </ol>
+                        </dd>
+                      </div>
+                    </dl>
+
+                    <h4>四方原始会签意见</h4>
+                    <ol class="version-approvals">
+                      @for (approval of version.approvals; track approval.stage) {
+                        <li [ngClass]="approval.state">
+                          <strong>{{ stageLabel(approval.stage) }}</strong>
+                          <span>{{ approvalStateText(approval.state) }}</span>
+                          @if (approval.approver) {
+                            <small>{{ approval.approver }} · {{ approval.decidedAt | date: 'MM-dd HH:mm' }}</small>
+                          }
+                          @if (approval.comment) {
+                            <p>{{ approval.comment }}</p>
+                          }
+                        </li>
+                      }
+                    </ol>
+
+                    @if (selectedDiff(); as diff) {
+                      <h4>前后差异（{{ compareTarget()?.version }} → {{ version.version }}）</h4>
+                      @if (diff.entries.length) {
+                        <table class="diff-table">
+                          <thead>
+                            <tr>
+                              <th>类别</th>
+                              <th>内容</th>
+                              <th>变更前</th>
+                              <th>变更后</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            @for (entry of diff.entries; track $index) {
+                              <tr>
+                                <td><span class="diff-kind">{{ diffKindLabel(entry.kind) }}</span></td>
+                                <td>{{ entry.label }}</td>
+                                <td>{{ entry.from || '—' }}</td>
+                                <td>{{ entry.to || '—' }}</td>
+                              </tr>
+                            }
+                          </tbody>
+                        </table>
+                      } @else {
+                        <p class="empty">两个版本的参与对象、窗口和步骤摘要完全一致。</p>
+                      }
+                    }
+                  </div>
+                }
+              </div>
+              } @else {
+                <p class="empty">尚未送审过任何版本；提交审批后将固定第 1 版。</p>
+              }
+            }
+          </section>
         }
 
         @case ('audit') {
@@ -489,7 +715,7 @@ type DetailTab = 'overview' | 'dependency' | 'window' | 'execution' | 'approval'
                 </div>
                 <div>
                   <dt>完成步骤</dt>
-                  <dd>{{ completedSteps(item) }} / {{ item.steps.length }}</dd>
+                  <dd>{{ executionSteps().filter((step) => step.completed).length }} / {{ executionSteps().length }}</dd>
                 </div>
               </dl>
               <div class="retrospective-note">
@@ -610,6 +836,57 @@ type DetailTab = 'overview' | 'dependency' | 'window' | 'execution' | 'approval'
         border-color: #d58d7e;
         background: #fbece8;
         color: #8e260f;
+      }
+
+      .status.resubmit {
+        border-color: #c21d00;
+        background: #fbe0da;
+        color: #8e260f;
+        font-weight: 600;
+      }
+
+      .version-badge {
+        padding: 3px 10px;
+        border: 1px solid #5688a5;
+        background: #eaf4f9;
+        color: #1d5877;
+        font-size: 12px;
+        white-space: nowrap;
+      }
+
+      .version-badge.invalidated {
+        border-color: #c21d00;
+        background: #fbe0da;
+        color: #8e260f;
+      }
+
+      .invalidation-banner {
+        margin-top: 14px;
+        padding: 14px 16px;
+        border-left: 3px solid #c21d00;
+        background: #fbece8;
+        color: #8e260f;
+      }
+
+      .invalidation-banner.compact {
+        margin: 14px 0 0;
+        padding: 10px 14px;
+        font-size: 13px;
+      }
+
+      .invalidation-banner p {
+        margin: 6px 0 0;
+        line-height: 1.6;
+      }
+
+      .edit-warning {
+        margin-bottom: 14px;
+        padding: 10px 14px;
+        border-left: 3px solid #d0a251;
+        background: #fff7e6;
+        color: #7c5000;
+        font-size: 13px;
+        line-height: 1.6;
       }
 
       .tab-nav {
@@ -924,6 +1201,227 @@ type DetailTab = 'overview' | 'dependency' | 'window' | 'execution' | 'approval'
         color: #5f5f5f;
       }
 
+      .approval-flow li.invalidated {
+        opacity: 0.65;
+      }
+
+      .approval-flow li.invalidated .flow-index {
+        border-color: #c21d00;
+        background: #fbece8;
+        color: #8e260f;
+      }
+
+      .version-layout {
+        display: grid;
+        grid-template-columns: 260px minmax(0, 1fr);
+        gap: 20px;
+        padding-top: 18px;
+      }
+
+      .version-list {
+        margin: 0;
+        padding: 0;
+        list-style: none;
+        border-right: 1px solid #e3e3e3;
+      }
+
+      .version-list li button {
+        display: flex;
+        width: 100%;
+        flex-direction: column;
+        gap: 4px;
+        padding: 12px 14px;
+        border: 0;
+        border-left: 3px solid transparent;
+        background: transparent;
+        text-align: left;
+        cursor: pointer;
+      }
+
+      .version-list li:hover button {
+        background: #f6fafc;
+      }
+
+      .version-list li.active button {
+        border-left-color: #266c91;
+        background: #eaf4f9;
+      }
+
+      .version-row-head {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+      }
+
+      .version-list small {
+        color: #737373;
+        font-size: 11px;
+      }
+
+      .current-tag {
+        color: #245f3d;
+        font-size: 11px;
+        font-style: normal;
+      }
+
+      .version-state {
+        padding: 1px 7px;
+        background: #eef1f3;
+        color: #555;
+        font-size: 10px;
+      }
+
+      .version-state.in_review {
+        background: #eaf4f9;
+        color: #215a78;
+      }
+
+      .version-state.approved,
+      .version-state.frozen {
+        background: #e8f5ed;
+        color: #245f3d;
+      }
+
+      .version-state.rejected,
+      .version-state.invalidated {
+        background: #fbece8;
+        color: #8e260f;
+      }
+
+      .version-detail-head {
+        display: flex;
+        align-items: flex-end;
+        justify-content: space-between;
+        gap: 16px;
+      }
+
+      .version-detail h3 {
+        margin: 0;
+        font-size: 16px;
+      }
+
+      .compare-select {
+        width: 220px;
+      }
+
+      .version-facts {
+        display: grid;
+        gap: 1px;
+        margin: 16px 0;
+        background: #e1e1e1;
+        border: 1px solid #e1e1e1;
+      }
+
+      .version-facts > div {
+        padding: 12px 14px;
+        background: #fafafa;
+      }
+
+      .version-facts dt {
+        color: #666;
+        font-size: 12px;
+      }
+
+      .version-facts dd {
+        margin: 6px 0 0;
+      }
+
+      .chip {
+        display: inline-block;
+        margin: 0 6px 4px 0;
+        padding: 2px 8px;
+        background: #edf3f6;
+        color: #205d7e;
+        font-size: 11px;
+      }
+
+      .version-steps {
+        margin: 0;
+        padding-left: 0;
+        list-style: none;
+      }
+
+      .version-steps li {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        padding: 5px 0;
+        border-bottom: 1px dashed #e6e6e6;
+        font-size: 13px;
+      }
+
+      .version-steps li:last-child {
+        border-bottom: 0;
+      }
+
+      .version-steps small {
+        margin-left: auto;
+        color: #737373;
+      }
+
+      .version-detail h4 {
+        margin: 20px 0 10px;
+        font-size: 14px;
+      }
+
+      .version-approvals {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 1px;
+        margin: 0;
+        padding: 0;
+        list-style: none;
+        background: #e1e1e1;
+        border: 1px solid #e1e1e1;
+      }
+
+      .version-approvals li {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 4px 10px;
+        padding: 12px 14px;
+        background: #fafafa;
+      }
+
+      .version-approvals li small {
+        color: #737373;
+        font-size: 11px;
+      }
+
+      .version-approvals li p {
+        flex-basis: 100%;
+        margin: 4px 0 0;
+        color: #5f5f5f;
+        font-size: 12px;
+      }
+
+      .diff-table {
+        width: 100%;
+        border-collapse: collapse;
+        font-size: 12px;
+      }
+
+      .diff-table th,
+      .diff-table td {
+        padding: 8px 10px;
+        border: 1px solid #e3e3e3;
+        text-align: left;
+        vertical-align: top;
+      }
+
+      .diff-table th {
+        background: #f7f8f8;
+      }
+
+      .diff-kind {
+        padding: 1px 7px;
+        background: #eef3f6;
+        color: #205d7e;
+        white-space: nowrap;
+      }
+
       .empty {
         color: #737373;
       }
@@ -951,8 +1449,18 @@ type DetailTab = 'overview' | 'dependency' | 'window' | 'execution' | 'approval'
         .heading-meta,
         .facts,
         .edit-grid,
-        .freeze-strip {
+        .freeze-strip,
+        .version-approvals {
           grid-template-columns: 1fr;
+        }
+
+        .version-layout {
+          grid-template-columns: 1fr;
+        }
+
+        .version-list {
+          border-right: 0;
+          border-bottom: 1px solid #e3e3e3;
         }
 
         .heading-meta div {
@@ -987,6 +1495,8 @@ export class ChangeDetailComponent {
   readonly approvalComment = signal('');
   readonly deviationText = signal('');
   readonly deviationDecision = signal<DeviationRecord['decision']>('continue');
+  readonly selectedVersion = signal<number | null>(null);
+  readonly compareVersion = signal<number | null>(null);
 
   readonly tabs: Array<{ id: DetailTab; label: string }> = [
     { id: 'overview', label: '方案概览' },
@@ -994,6 +1504,7 @@ export class ChangeDetailComponent {
     { id: 'window', label: '窗口甘特' },
     { id: 'execution', label: '执行记录' },
     { id: 'approval', label: '审批会签' },
+    { id: 'versions', label: '版本历史' },
     { id: 'audit', label: '审计复盘' },
   ];
 
@@ -1006,16 +1517,73 @@ export class ChangeDetailComponent {
     this.issues().some((issue) => issue.severity === 'blocker'),
   );
 
-  readonly pendingStage = computed<ApprovalStage | null>(() => {
+  /** 当前有效（送审冻结）版本；待重新提交或草稿时为 null */
+  readonly currentVersionRecord = computed<PlanVersion | null>(() => {
     const item = this.change();
-    if (!item || !['submitted', 'rejected'].includes(item.status)) {
+    return item ? getCurrentVersion(item) : null;
+  });
+
+  readonly versionHistory = computed<PlanVersion[]>(() => {
+    const item = this.change();
+    return item ? [...item.versions].sort((left, right) => right.version - left.version) : [];
+  });
+
+  readonly selectedVersionRecord = computed<PlanVersion | null>(() => {
+    const history = this.versionHistory();
+    const wanted = this.selectedVersion();
+    if (wanted == null) {
+      return history[0] ?? null;
+    }
+    return history.find((version) => version.version === wanted) ?? history[0] ?? null;
+  });
+
+  readonly compareTarget = computed<PlanVersion | null>(() => {
+    const item = this.change();
+    const selected = this.selectedVersionRecord();
+    if (!item || !selected || this.compareVersion() == null) {
       return null;
     }
-    const rejected = item.approvals.find((approval) => approval.state === 'rejected');
-    if (rejected) {
-      return rejected.stage;
+    return item.versions.find((version) => version.version === this.compareVersion()) ?? null;
+  });
+
+  readonly selectedDiff = computed<VersionDiff | null>(() => {
+    const selected = this.selectedVersionRecord();
+    const compare = this.compareTarget();
+    if (!selected || !compare) {
+      return null;
+    }
+    return diffVersions(compare, selected);
+  });
+
+  readonly canResubmit = computed(() => {
+    const item = this.change();
+    return !!item && ['draft', 'rejected', 'resubmit'].includes(item.status) && !this.hasBlockers();
+  });
+
+  readonly pendingStage = computed<ApprovalStage | null>(() => {
+    const item = this.change();
+    if (!item || item.status !== 'submitted') {
+      return null;
     }
     return item.approvals.find((approval) => approval.state === 'pending')?.stage ?? null;
+  });
+
+  /** 执行页只读当前有效版本：步骤以冻结版本为准，勾选状态取工作副本。 */
+  readonly executionSteps = computed(() => {
+    const item = this.change();
+    const version = this.currentVersionRecord();
+    if (!item || !version) {
+      return [];
+    }
+    const liveById = new Map(item.steps.map((step) => [step.id, step]));
+    return this.stepsBy([...version.steps] as ChangeStep[]).map((frozen) => {
+      const live = liveById.get(frozen.id);
+      return {
+        ...frozen,
+        completed: live?.completed ?? false,
+        completedAt: live?.completedAt,
+      };
+    });
   });
 
   beginEdit(): void {
@@ -1064,7 +1632,7 @@ export class ChangeDetailComponent {
   }
 
   submitForReview(): void {
-    if (!this.hasBlockers()) {
+    if (this.canResubmit()) {
       this.store.dispatch(ChangeRequestActions.submitForReview({ id: this.changeId }));
     }
   }
@@ -1148,16 +1716,12 @@ export class ChangeDetailComponent {
     URL.revokeObjectURL(url);
   }
 
-  stepsBy(change: ChangeRequest): ChangeStep[] {
+  stepsBy(change: ChangeStep[]): ChangeStep[] {
     const order: ChangeStep['phase'][] = ['prepare', 'execute', 'verify', 'rollback'];
-    return [...change.steps].sort((left, right) => {
+    return [...change].sort((left, right) => {
       const phase = order.indexOf(left.phase) - order.indexOf(right.phase);
       return phase || left.id.localeCompare(right.id);
     });
-  }
-
-  completedSteps(change: ChangeRequest): number {
-    return change.steps.filter((step) => step.completed).length;
   }
 
   statusLabel(status: ChangeRequest['status']): string {
@@ -1186,7 +1750,35 @@ export class ChangeDetailComponent {
       approved: '已批准',
       rejected: '已退回',
       frozen: '已冻结',
+      invalidated: '随版本失效',
     }[state];
+  }
+
+  versionStateLabel(state: PlanVersion['state']): string {
+    return VERSION_STATE_LABELS[state];
+  }
+
+  selectVersion(version: number): void {
+    this.selectedVersion.set(version);
+    this.compareVersion.set(null);
+  }
+
+  setCompareVersion(value: string | number | null): void {
+    if (value === null || value === '' || value === 'none') {
+      this.compareVersion.set(null);
+      return;
+    }
+    this.compareVersion.set(Number(value));
+  }
+
+  diffKindLabel(kind: PlanVersion['state'] | VersionDiff['entries'][number]['kind']): string {
+    return (
+      {
+        resource: '参与对象',
+        window: '窗口',
+        step: '步骤',
+      } as Record<string, string>
+    )[kind] ?? kind;
   }
 
   approvalGate(): string {
@@ -1194,11 +1786,20 @@ export class ChangeDetailComponent {
     if (!item) {
       return '-';
     }
+    if (item.status === 'resubmit') {
+      return `第 ${item.versions.length} 版已失效，待重新提交`;
+    }
     if (item.status === 'approved') {
-      return '已批准，等待执行';
+      return `第 ${item.currentVersion ?? '-'} 版已批准，等待执行`;
     }
     if (['executing', 'completed', 'rolled_back'].includes(item.status)) {
-      return '审批已冻结';
+      return `按第 ${item.currentVersion ?? '-'} 版冻结执行`;
+    }
+    if (item.status === 'submitted') {
+      return `第 ${item.currentVersion ?? '-'} 版会签中`;
+    }
+    if (item.status === 'rejected') {
+      return `第 ${item.currentVersion ?? '-'} 版已退回`;
     }
     return '方案草稿';
   }

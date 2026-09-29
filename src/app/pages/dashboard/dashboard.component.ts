@@ -143,6 +143,11 @@ import {
                   <a [routerLink]="['/changes', change.id]" class="change-link">
                     <span>{{ change.id }}</span>
                     <strong>{{ change.title }}</strong>
+                    @if (change.currentVersion != null) {
+                      <small class="version-tag">第 {{ change.currentVersion }} 版有效</small>
+                    } @else if (change.versions.length) {
+                      <small class="version-tag invalidated">签字已失效 · 待重新提交</small>
+                    }
                   </a>
                 </td>
                 <td>
@@ -367,6 +372,26 @@ import {
         border-color: #d58d7e;
         color: #8e260f;
         background: #fbece8;
+      }
+
+      .status.resubmit {
+        border-color: #c21d00;
+        color: #8e260f;
+        background: #fbe0da;
+        font-weight: 600;
+      }
+
+      .version-tag {
+        width: fit-content;
+        padding: 1px 6px;
+        background: #eaf4f9;
+        color: #215a78;
+        font-size: 10px;
+      }
+
+      .version-tag.invalidated {
+        background: #fbe0da;
+        color: #8e260f;
       }
 
       .risk.medium {
