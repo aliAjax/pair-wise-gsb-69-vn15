@@ -1,11 +1,5 @@
 import { DatePipe, NgClass } from '@angular/common';
-import {
-  ChangeDetectionStrategy,
-  Component,
-  computed,
-  inject,
-  signal,
-} from '@angular/core';
+import { ChangeDetectionStrategy, Component, computed, inject, signal } from '@angular/core';
 import { FormsModule } from '@angular/forms';
 import { ActivatedRoute, RouterLink } from '@angular/router';
 import { ClarityModule } from '@clr/angular';
@@ -13,24 +7,32 @@ import { Store } from '@ngrx/store';
 import { AuditTrailComponent } from '../../components/audit-trail/audit-trail.component';
 import { DependencyGraphComponent } from '../../components/dependency-graph/dependency-graph.component';
 import { ValidationPanelComponent } from '../../components/validation-panel/validation-panel.component';
+import { VersionHistoryComponent } from '../../components/version-history/version-history.component';
 import { WindowGanttComponent } from '../../components/window-gantt/window-gantt.component';
 import {
   ApprovalStage,
   ChangeRequest,
+  ChangeResource,
   ChangeStep,
+  DIFF_AREA_LABELS,
   DeviationRecord,
   PHASE_LABELS,
   RESOURCE_LABELS,
   RISK_LABELS,
   STAGE_LABELS,
   STATUS_LABELS,
+  StepPhase,
+  diffPlanVersions,
+  getActiveVersion,
+  getEffectivePlan,
   validateChange,
 } from '../../models/change-request.model';
 import { ChangeRequestService } from '../../services/change-request.service';
 import { ChangeRequestActions } from '../../store/change-request.actions';
 import { selectAllChanges } from '../../store/change-request.selectors';
 
-type DetailTab = 'overview' | 'dependency' | 'window' | 'execution' | 'approval' | 'audit';
+type DetailTab =
+  'overview' | 'dependency' | 'window' | 'execution' | 'approval' | 'versions' | 'audit';
 
 @Component({
   selector: 'app-change-detail',
@@ -44,6 +46,7 @@ type DetailTab = 'overview' | 'dependency' | 'window' | 'execution' | 'approval'
     AuditTrailComponent,
     DependencyGraphComponent,
     ValidationPanelComponent,
+    VersionHistoryComponent,
     WindowGanttComponent,
   ],
   template: `
@@ -57,8 +60,27 @@ type DetailTab = 'overview' | 'dependency' | 'window' | 'execution' | 'approval'
               <h1>{{ item.title }}</h1>
             </div>
             <span class="status" [class]="item.status">{{ statusLabel(item.status) }}</span>
+            @if (activeVersion(); as version) {
+              <span class="version-chip">当前有效 v{{ version.version }}</span>
+            } @else if (item.executingVersion) {
+              <span class="version-chip executing">执行锁定 v{{ item.executingVersion }}</span>
+            }
           </div>
           <p>{{ item.summary || '尚未填写变更摘要。' }}</p>
+          @if (item.status === 'resubmit_required') {
+            <div class="resubmit-banner">
+              <strong>当前编辑内容尚未重新送审</strong>
+              <span>
+                已冻结版本的{{
+                  latestInvalidatedAreas(item)
+                }}发生变化，旧签字全部失效；请核对方案后到
+                <button type="button" class="link-btn" (click)="selectedTab.set('approval')">
+                  审批会签
+                </button>
+                重新提交，四方意见按新版本重走。
+              </span>
+            </div>
+          }
         </div>
         <div class="heading-meta">
           <div>
@@ -158,8 +180,164 @@ type DetailTab = 'overview' | 'dependency' | 'window' | 'execution' | 'approval'
                       />
                     </clr-input-container>
                   </div>
+
+                  <div class="edit-block">
+                    <h3>参与对象（机柜、依赖等）</h3>
+                    <p class="block-hint">
+                      会签中或已批准时改动对象，将使旧签字失效并回到待重新提交。
+                    </p>
+                    <div class="mini-form">
+                      <clr-input-container>
+                        <label>对象 ID</label>
+                        <input
+                          clrInput
+                          [ngModel]="newResourceId()"
+                          (ngModelChange)="newResourceId.set($event)"
+                        />
+                      </clr-input-container>
+                      <clr-input-container>
+                        <label>对象名称</label>
+                        <input
+                          clrInput
+                          [ngModel]="newResourceName()"
+                          (ngModelChange)="newResourceName.set($event)"
+                        />
+                      </clr-input-container>
+                      <clr-select-container>
+                        <label>类型</label>
+                        <select
+                          clrSelect
+                          [ngModel]="newResourceType()"
+                          (ngModelChange)="newResourceType.set($event)"
+                        >
+                          @for (type of resourceTypes; track type) {
+                            <option [value]="type">{{ resourceLabel(type) }}</option>
+                          }
+                        </select>
+                      </clr-select-container>
+                      <clr-input-container>
+                        <label>依赖 ID（逗号分隔）</label>
+                        <input
+                          clrInput
+                          [ngModel]="newDependencyText()"
+                          (ngModelChange)="newDependencyText.set($event)"
+                        />
+                      </clr-input-container>
+                      <button class="btn btn-sm" type="button" (click)="addDraftResource()">
+                        添加对象
+                      </button>
+                    </div>
+                    <ul class="edit-list">
+                      @for (resource of draft()?.resources; track resource.id) {
+                        <li>
+                          <div class="edit-item-main">
+                            <strong>{{ resource.name }}</strong>
+                            <span
+                              >{{ resource.id }} · {{ resourceLabel(resource.type) }} · 依赖
+                              {{ resource.dependencies.join('、') || '无' }}</span
+                            >
+                          </div>
+                          <label class="inline-check">
+                            <input
+                              type="checkbox"
+                              [checked]="resource.critical"
+                              (change)="toggleDraftResourceCritical(resource.id)"
+                            />
+                            关键
+                          </label>
+                          <button
+                            class="btn btn-sm btn-link"
+                            type="button"
+                            (click)="removeDraftResource(resource.id)"
+                          >
+                            移除
+                          </button>
+                        </li>
+                      }
+                    </ul>
+                  </div>
+
+                  <div class="edit-block">
+                    <h3>执行与回滚步骤摘要</h3>
+                    <p class="block-hint">步骤标题、责任人或命令变更均会触发旧签字失效。</p>
+                    <div class="mini-form step-mini">
+                      <clr-input-container>
+                        <label>步骤名称</label>
+                        <input
+                          clrInput
+                          [ngModel]="newStepTitle()"
+                          (ngModelChange)="newStepTitle.set($event)"
+                        />
+                      </clr-input-container>
+                      <clr-select-container>
+                        <label>阶段</label>
+                        <select
+                          clrSelect
+                          [ngModel]="newStepPhase()"
+                          (ngModelChange)="newStepPhase.set($event)"
+                        >
+                          <option value="prepare">准备</option>
+                          <option value="execute">执行</option>
+                          <option value="verify">验证</option>
+                          <option value="rollback">回滚</option>
+                        </select>
+                      </clr-select-container>
+                      <clr-input-container>
+                        <label>责任人</label>
+                        <input
+                          clrInput
+                          [ngModel]="newStepOwner()"
+                          (ngModelChange)="newStepOwner.set($event)"
+                        />
+                      </clr-input-container>
+                      <clr-input-container>
+                        <label>命令或操作</label>
+                        <input
+                          clrInput
+                          [ngModel]="newStepCommand()"
+                          (ngModelChange)="newStepCommand.set($event)"
+                        />
+                      </clr-input-container>
+                      <button class="btn btn-sm" type="button" (click)="addDraftStep()">
+                        添加步骤
+                      </button>
+                    </div>
+                    <ul class="edit-list">
+                      @for (step of draft()?.steps; track step.id) {
+                        <li>
+                          <div class="edit-item-main">
+                            <strong>{{ phaseLabel(step.phase) }}｜{{ step.title }}</strong>
+                            <span
+                              >{{ step.owner || '未指定责任人' }} ·
+                              {{ step.command || '缺少命令' }}</span
+                            >
+                          </div>
+                          <button
+                            class="btn btn-sm btn-link"
+                            type="button"
+                            (click)="removeDraftStep(step.id)"
+                          >
+                            移除
+                          </button>
+                        </li>
+                      }
+                    </ul>
+                  </div>
+
+                  @if (pendingMaterialDiff(); as diff) {
+                    <div class="invalid-warning">
+                      <strong>保存后当前版本签字将失效</strong>
+                      <p>
+                        相对当前有效版本，以下内容已变化：
+                        {{ diff.areas.map(areaLabel).join('、') }}。保存后方案回到待重新提交，
+                        网络、系统、安全、业务意见需按新版本全部重签；历史版本与原意见仍可在“版本与差异”中查看。
+                      </p>
+                    </div>
+                  }
                   <div class="edit-actions">
-                    <button class="btn btn-primary" type="button" (click)="saveEdit()">保存方案</button>
+                    <button class="btn btn-primary" type="button" (click)="saveEdit()">
+                      保存方案
+                    </button>
                   </div>
                 </div>
               } @else {
@@ -181,7 +359,13 @@ type DetailTab = 'overview' | 'dependency' | 'window' | 'execution' | 'approval'
                   </div>
                   <div>
                     <dt>当前门禁</dt>
-                    <dd>{{ pendingStage() ? stageLabel(pendingStage()!) + '待会签' : approvalGate() }}</dd>
+                    <dd>
+                      {{ pendingStage() ? stageLabel(pendingStage()!) + '待会签' : approvalGate() }}
+                    </dd>
+                  </div>
+                  <div>
+                    <dt>有效送审版本</dt>
+                    <dd>{{ effectiveVersionLabel(item) }}</dd>
                   </div>
                 </dl>
               }
@@ -258,34 +442,51 @@ type DetailTab = 'overview' | 'dependency' | 'window' | 'execution' | 'approval'
               <div class="surface-heading">
                 <div>
                   <h2>执行步骤</h2>
-                  <span>执行中可逐项勾选，所有操作保留时间戳</span>
+                  <span>
+                    执行页只读取当前有效版本
+                    @if (effectivePlan(item); as plan) {
+                      <strong>（v{{ plan.version }}）</strong>
+                    }
+                    ，逐项勾选保留时间戳
+                  </span>
                 </div>
-                @if (item.status === 'approved') {
+                @if (item.status === 'approved' && effectivePlan(item)) {
                   <button class="btn btn-primary" type="button" (click)="startExecution()">
                     开始执行
                   </button>
                 }
               </div>
-              <div class="step-list">
-                @for (step of stepsBy(item); track step.id) {
-                  <label class="step-row" [class.completed]="step.completed">
-                    <input
-                      type="checkbox"
-                      [checked]="step.completed"
-                      [disabled]="item.status !== 'executing'"
-                      (change)="toggleStep(step.id)"
-                    />
-                    <span class="phase">{{ phaseLabel(step.phase) }}</span>
-                    <div>
-                      <strong>{{ step.title }}</strong>
-                      <code>{{ step.command || '未填写命令' }}</code>
-                    </div>
-                    <span>{{ step.owner || '未指定' }}</span>
-                  </label>
-                } @empty {
-                  <p class="empty">没有执行步骤。</p>
-                }
-              </div>
+              @if (item.status === 'resubmit_required') {
+                <p class="invalid-warning">
+                  方案内容已变更并回到待重新提交，当前没有可执行的有效版本；重新会签批准后方可执行。
+                </p>
+              }
+              @if (effectivePlan(item); as plan) {
+                <div class="step-list">
+                  @for (step of stepsBy(plan); track step.id) {
+                    <label class="step-row" [class.completed]="step.completed">
+                      <input
+                        type="checkbox"
+                        [checked]="step.completed"
+                        [disabled]="
+                          item.status !== 'executing' || item.executingVersion !== plan.version
+                        "
+                        (change)="toggleStep(step.id)"
+                      />
+                      <span class="phase">{{ phaseLabel(step.phase) }}</span>
+                      <div>
+                        <strong>{{ step.title }}</strong>
+                        <code>{{ step.command || '未填写命令' }}</code>
+                      </div>
+                      <span>{{ step.owner || '未指定' }}</span>
+                    </label>
+                  } @empty {
+                    <p class="empty">该版本没有执行步骤。</p>
+                  }
+                </div>
+              } @else {
+                <p class="empty">当前没有有效版本，执行步骤不可勾选。</p>
+              }
             </section>
 
             <section class="surface">
@@ -294,7 +495,12 @@ type DetailTab = 'overview' | 'dependency' | 'window' | 'execution' | 'approval'
                   <h2>实时执行记录</h2>
                   <span>记录偏离并明确继续、暂停或回滚</span>
                 </div>
-                <a class="btn btn-sm" href="https://logs.example.internal/change/{{ item.id }}" target="_blank" rel="noopener">
+                <a
+                  class="btn btn-sm"
+                  href="https://logs.example.internal/change/{{ item.id }}"
+                  target="_blank"
+                  rel="noopener"
+                >
                   打开实时日志
                 </a>
               </div>
@@ -327,7 +533,9 @@ type DetailTab = 'overview' | 'dependency' | 'window' | 'execution' | 'approval'
                   </div>
                 </div>
                 <div class="completion-actions">
-                  <button class="btn" type="button" (click)="complete('rolled_back')">判定回滚</button>
+                  <button class="btn" type="button" (click)="complete('rolled_back')">
+                    判定回滚
+                  </button>
                   <button class="btn btn-primary" type="button" (click)="complete('completed')">
                     执行完成
                   </button>
@@ -357,19 +565,42 @@ type DetailTab = 'overview' | 'dependency' | 'window' | 'execution' | 'approval'
               <div class="surface-heading">
                 <div>
                   <h2>顺序会签</h2>
-                  <span>必须按网络、系统、安全、业务顺序完成</span>
+                  <span>
+                    必须按网络、系统、安全、业务顺序完成
+                    @if (activeVersion(); as version) {
+                      <strong>· 当前会签版本 v{{ version.version }}</strong>
+                    }
+                  </span>
                 </div>
-                @if (item.status === 'draft' || item.status === 'rejected') {
+                @if (
+                  item.status === 'draft' ||
+                  item.status === 'rejected' ||
+                  item.status === 'resubmit_required'
+                ) {
                   <button
                     class="btn btn-primary"
                     type="button"
                     (click)="submitForReview()"
                     [disabled]="hasBlockers()"
                   >
-                    提交审批
+                    {{ item.status === 'resubmit_required' ? '重新提交新版本' : '提交审批' }}
                   </button>
                 }
               </div>
+              @if (item.status === 'resubmit_required') {
+                <div class="resubmit-card">
+                  <strong>原签字已失效，需重新提交</strong>
+                  <p>
+                    已冻结方案的{{
+                      latestInvalidatedAreas(item)
+                    }}在会签后被修改，上一版本的四方意见全部作废。
+                    重新提交将冻结为新版本，网络、系统、安全、业务意见按新版本重新会签。
+                  </p>
+                  <button type="button" class="link-btn" (click)="selectedTab.set('versions')">
+                    查看历史版本与前后差异 →
+                  </button>
+                </div>
+              }
               <ol class="approval-flow">
                 @for (approval of item.approvals; track approval.stage) {
                   <li [ngClass]="approval.state">
@@ -428,29 +659,55 @@ type DetailTab = 'overview' | 'dependency' | 'window' | 'execution' | 'approval'
                   <p class="empty">当前状态不允许审批操作。</p>
                 }
               } @else {
-                <p class="approved-message">
-                  会签已完成。开始执行后审批记录自动冻结，不允许修改。
-                </p>
+                <p class="approved-message">会签已完成。开始执行后审批记录自动冻结，不允许修改。</p>
               }
             </section>
 
             <section class="surface span-2">
               <div class="surface-heading">
                 <div>
-                  <h2>审批冻结快照</h2>
-                  <span>执行与复盘以冻结版本为准</span>
+                  <h2>会签版本快照</h2>
+                  <span>
+                    执行与复盘以冻结版本为准
+                    @if (activeVersion(); as version) {
+                      <strong>· v{{ version.version }}</strong>
+                    }
+                  </span>
                 </div>
+                <button class="btn btn-sm" type="button" (click)="selectedTab.set('versions')">
+                  历史版本与差异
+                </button>
               </div>
               <div class="freeze-strip">
                 @for (approval of item.approvals; track approval.stage) {
                   <div>
                     <span>{{ stageLabel(approval.stage) }}</span>
                     <strong>{{ approvalStateText(approval.state) }}</strong>
+                    @if (approval.approver) {
+                      <small>{{ approval.approver }}</small>
+                    }
                   </div>
                 }
               </div>
+              @if (item.status === 'resubmit_required') {
+                <p class="invalid-warning">
+                  上一版本的原意见仍可在“版本与差异”中查阅，但已不再作为执行依据。
+                </p>
+              }
             </section>
           </div>
+        }
+
+        @case ('versions') {
+          <section class="surface">
+            <div class="surface-heading">
+              <div>
+                <h2>历史版本与前后差异</h2>
+                <span>每次送审冻结一个版本；失效版本保留原意见，但不能勾选执行</span>
+              </div>
+            </div>
+            <app-version-history [change]="item" />
+          </section>
         }
 
         @case ('audit') {
@@ -598,6 +855,52 @@ type DetailTab = 'overview' | 'dependency' | 'window' | 'execution' | 'approval'
         color: #1d5877;
       }
 
+      .status.resubmit_required {
+        border-color: #d0a251;
+        background: #fff7e6;
+        color: #7c5000;
+      }
+
+      .version-chip {
+        padding: 3px 9px;
+        border: 1px solid #8fb99f;
+        background: #edf7f0;
+        color: #286140;
+        font-size: 12px;
+      }
+
+      .version-chip.executing {
+        border-color: #266c91;
+        background: #eaf4f9;
+        color: #1d5877;
+      }
+
+      .resubmit-banner {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px 10px;
+        margin-top: 12px;
+        padding: 12px 14px;
+        border-left: 3px solid #d0a251;
+        background: #fff7e6;
+        color: #5f4400;
+        font-size: 13px;
+      }
+
+      .resubmit-banner strong {
+        color: #7c5000;
+      }
+
+      .link-btn {
+        padding: 0;
+        border: 0;
+        background: none;
+        color: #1d5877;
+        text-decoration: underline;
+        cursor: pointer;
+        font: inherit;
+      }
+
       .status.executing,
       .status.completed {
         border-color: #75a489;
@@ -709,6 +1012,101 @@ type DetailTab = 'overview' | 'dependency' | 'window' | 'execution' | 'approval'
 
       .edit-form {
         padding-top: 18px;
+      }
+
+      .edit-block {
+        margin-top: 20px;
+        padding-top: 16px;
+        border-top: 1px dashed #d0d0d0;
+      }
+
+      .edit-block h3 {
+        margin: 0;
+        font-size: 14px;
+      }
+
+      .block-hint {
+        margin: 4px 0 10px;
+        color: #8a6d2f;
+        font-size: 11px;
+      }
+
+      .mini-form,
+      .step-mini {
+        display: grid;
+        grid-template-columns: repeat(4, minmax(110px, 1fr)) auto;
+        gap: 10px;
+        align-items: end;
+        margin-bottom: 10px;
+      }
+
+      .edit-list {
+        margin: 8px 0 0;
+        padding: 0;
+        list-style: none;
+      }
+
+      .edit-list li {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        padding: 8px 2px;
+        border-bottom: 1px solid #ececec;
+      }
+
+      .edit-item-main {
+        display: flex;
+        flex: 1;
+        flex-direction: column;
+        gap: 2px;
+      }
+
+      .edit-item-main span {
+        color: #777;
+        font-size: 11px;
+      }
+
+      .inline-check {
+        display: flex;
+        align-items: center;
+        gap: 4px;
+        font-size: 12px;
+        color: #555;
+      }
+
+      .invalid-warning {
+        margin: 14px 0 0;
+        padding: 12px 14px;
+        border-left: 3px solid #c21d00;
+        background: #fbece8;
+        color: #8e260f;
+        font-size: 12px;
+      }
+
+      .invalid-warning p {
+        margin: 6px 0 0;
+        line-height: 1.6;
+      }
+
+      .resubmit-card {
+        margin-top: 14px;
+        padding: 14px;
+        border-left: 3px solid #d0a251;
+        background: #fff7e6;
+      }
+
+      .resubmit-card p {
+        margin: 6px 0 8px;
+        color: #5f4400;
+        font-size: 12px;
+        line-height: 1.6;
+      }
+
+      .freeze-strip small {
+        display: block;
+        margin-top: 3px;
+        color: #888;
+        font-size: 10px;
       }
 
       .edit-grid,
@@ -951,7 +1349,9 @@ type DetailTab = 'overview' | 'dependency' | 'window' | 'execution' | 'approval'
         .heading-meta,
         .facts,
         .edit-grid,
-        .freeze-strip {
+        .freeze-strip,
+        .mini-form,
+        .step-mini {
           grid-template-columns: 1fr;
         }
 
@@ -988,12 +1388,55 @@ export class ChangeDetailComponent {
   readonly deviationText = signal('');
   readonly deviationDecision = signal<DeviationRecord['decision']>('continue');
 
+  readonly newResourceId = signal('');
+  readonly newResourceName = signal('');
+  readonly newResourceType = signal<ChangeResource['type']>('rack');
+  readonly newDependencyText = signal('');
+  readonly newStepTitle = signal('');
+  readonly newStepPhase = signal<StepPhase>('execute');
+  readonly newStepOwner = signal('');
+  readonly newStepCommand = signal('');
+  readonly resourceTypes: ChangeResource['type'][] = [
+    'datacenter',
+    'rack',
+    'network',
+    'storage',
+    'service',
+  ];
+
+  readonly activeVersion = computed(() => {
+    const item = this.change();
+    if (!item || !['submitted', 'approved'].includes(item.status)) {
+      return undefined;
+    }
+    return getActiveVersion(item);
+  });
+
+  /** 执行页只读的版本：执行锁定版本优先，其次当前有效版本 */
+  readonly effectivePlanVersion = computed(() => {
+    const item = this.change();
+    return item ? getEffectivePlan(item) : undefined;
+  });
+
+  /** 编辑中的工作副本相对当前有效版本的实质性差异 */
+  readonly pendingMaterialDiff = computed(() => {
+    const item = this.change();
+    const draft = this.draft();
+    const active = item ? getActiveVersion(item) : undefined;
+    if (!item || !draft || !active || !['submitted', 'approved'].includes(item.status)) {
+      return null;
+    }
+    const diff = diffPlanVersions(active, draft);
+    return diff.areas.length ? diff : null;
+  });
+
   readonly tabs: Array<{ id: DetailTab; label: string }> = [
     { id: 'overview', label: '方案概览' },
     { id: 'dependency', label: '依赖关系' },
     { id: 'window', label: '窗口甘特' },
     { id: 'execution', label: '执行记录' },
     { id: 'approval', label: '审批会签' },
+    { id: 'versions', label: '版本与差异' },
     { id: 'audit', label: '审计复盘' },
   ];
 
@@ -1017,19 +1460,114 @@ export class ChangeDetailComponent {
     }
     return item.approvals.find((approval) => approval.state === 'pending')?.stage ?? null;
   });
-
   beginEdit(): void {
     const item = this.change();
     if (!item) {
       return;
     }
     this.draft.set(structuredClone(item));
+    this.newResourceId.set('');
+    this.newResourceName.set('');
+    this.newDependencyText.set('');
+    this.newStepTitle.set('');
+    this.newStepOwner.set('');
+    this.newStepCommand.set('');
     this.editing.set(true);
   }
 
   cancelEdit(): void {
     this.editing.set(false);
     this.draft.set(null);
+  }
+
+  addDraftResource(): void {
+    const name = this.newResourceName().trim();
+    if (!name) {
+      return;
+    }
+    const id = this.newResourceId().trim() || name.toLowerCase().replace(/\s+/g, '-');
+    this.draft.update((draft) =>
+      draft
+        ? {
+            ...draft,
+            resources: [
+              ...draft.resources,
+              {
+                id,
+                name,
+                type: this.newResourceType(),
+                critical: false,
+                dependencies: this.newDependencyText()
+                  .split(/[、,，]/)
+                  .map((item) => item.trim())
+                  .filter(Boolean),
+              },
+            ],
+          }
+        : draft,
+    );
+    this.newResourceId.set('');
+    this.newResourceName.set('');
+    this.newDependencyText.set('');
+  }
+
+  removeDraftResource(resourceId: string): void {
+    this.draft.update((draft) =>
+      draft
+        ? {
+            ...draft,
+            resources: draft.resources.filter((resource) => resource.id !== resourceId),
+          }
+        : draft,
+    );
+  }
+
+  toggleDraftResourceCritical(resourceId: string): void {
+    this.draft.update((draft) =>
+      draft
+        ? {
+            ...draft,
+            resources: draft.resources.map((resource) =>
+              resource.id === resourceId ? { ...resource, critical: !resource.critical } : resource,
+            ),
+          }
+        : draft,
+    );
+  }
+
+  addDraftStep(): void {
+    const title = this.newStepTitle().trim();
+    if (!title) {
+      return;
+    }
+    this.draft.update((draft) =>
+      draft
+        ? {
+            ...draft,
+            steps: [
+              ...draft.steps,
+              {
+                id: `step-${Date.now()}`,
+                phase: this.newStepPhase(),
+                title,
+                owner: this.newStepOwner().trim(),
+                durationMinutes: 15,
+                command: this.newStepCommand().trim(),
+                completed: false,
+              },
+            ],
+          }
+        : draft,
+    );
+    this.newStepTitle.set('');
+    this.newStepOwner.set('');
+    this.newStepCommand.set('');
+  }
+
+  removeDraftStep(stepId: string): void {
+    this.draft.update((draft) =>
+      draft ? { ...draft, steps: draft.steps.filter((step) => step.id !== stepId) } : draft,
+    );
   }
 
   updateDraft<K extends keyof ChangeRequest>(key: K, value: ChangeRequest[K]): void {
@@ -1058,9 +1596,13 @@ export class ChangeDetailComponent {
     if (!draft) {
       return;
     }
+    const willInvalidate = !!this.pendingMaterialDiff();
     this.store.dispatch(ChangeRequestActions.updateChange({ change: draft }));
     this.editing.set(false);
     this.draft.set(null);
+    if (willInvalidate) {
+      this.selectedTab.set('approval');
+    }
   }
 
   submitForReview(): void {
@@ -1129,7 +1671,9 @@ export class ChangeDetailComponent {
       result === 'completed'
         ? '观察窗口内指标稳定，变更完成。'
         : '发现不可接受影响，按方案完成回滚。';
-    this.store.dispatch(ChangeRequestActions.completeExecution({ id: this.changeId, result, note }));
+    this.store.dispatch(
+      ChangeRequestActions.completeExecution({ id: this.changeId, result, note }),
+    );
   }
 
   exportRetrospective(): void {
@@ -1148,9 +1692,9 @@ export class ChangeDetailComponent {
     URL.revokeObjectURL(url);
   }
 
-  stepsBy(change: ChangeRequest): ChangeStep[] {
+  stepsBy(plan: { steps: ChangeStep[] }): ChangeStep[] {
     const order: ChangeStep['phase'][] = ['prepare', 'execute', 'verify', 'rollback'];
-    return [...change.steps].sort((left, right) => {
+    return [...plan.steps].sort((left, right) => {
       const phase = order.indexOf(left.phase) - order.indexOf(right.phase);
       return phase || left.id.localeCompare(right.id);
     });
@@ -1194,13 +1738,41 @@ export class ChangeDetailComponent {
     if (!item) {
       return '-';
     }
+    if (item.status === 'resubmit_required') {
+      return '旧签字已失效，待重新提交';
+    }
     if (item.status === 'approved') {
       return '已批准，等待执行';
     }
     if (['executing', 'completed', 'rolled_back'].includes(item.status)) {
-      return '审批已冻结';
+      return `执行锁定 v${item.executingVersion ?? 1}`;
     }
     return '方案草稿';
+  }
+
+  effectivePlan(item: ChangeRequest) {
+    return getEffectivePlan(item);
+  }
+
+  effectiveVersionLabel(item: ChangeRequest): string {
+    const plan = getEffectivePlan(item);
+    if (!plan) {
+      return item.status === 'resubmit_required' ? '无（待重新提交新版本）' : '尚未送审';
+    }
+    const suffix = item.executingVersion === plan.version ? '（执行锁定）' : '';
+    return `v${plan.version}${suffix}`;
+  }
+
+  latestInvalidatedAreas(item: ChangeRequest): string {
+    const version = item.versions.find((candidate) => candidate.state === 'invalidated');
+    if (!version || version.invalidatedAreas.length === 0) {
+      return '内容';
+    }
+    return version.invalidatedAreas.map((area) => DIFF_AREA_LABELS[area]).join('、');
+  }
+
+  areaLabel(area: keyof typeof DIFF_AREA_LABELS): string {
+    return DIFF_AREA_LABELS[area];
   }
 
   decisionLabel(decision: DeviationRecord['decision']): string {

@@ -11,6 +11,7 @@ import {
   RISK_LABELS,
   ResourceType,
   STATUS_LABELS,
+  getActiveVersion,
   validateChange,
 } from '../../models/change-request.model';
 import { ChangeRequestActions } from '../../store/change-request.actions';
@@ -101,11 +102,7 @@ import {
         </clr-select-container>
         <clr-select-container>
           <label>资源类型</label>
-          <select
-            clrSelect
-            [ngModel]="resourceType()"
-            (ngModelChange)="resourceType.set($event)"
-          >
+          <select clrSelect [ngModel]="resourceType()" (ngModelChange)="resourceType.set($event)">
             <option value="all">全部资源</option>
             @for (item of resourceTypes; track item.value) {
               <option [value]="item.value">{{ item.label }}</option>
@@ -146,7 +143,16 @@ import {
                   </a>
                 </td>
                 <td>
-                  <span class="status" [class]="change.status">{{ statusLabel(change.status) }}</span>
+                  <div class="status-cell">
+                    <span class="status" [class]="change.status">{{
+                      statusLabel(change.status)
+                    }}</span>
+                    @if (activeVersionNo(change.id); as vno) {
+                      <small class="version-no">有效 v{{ vno }}</small>
+                    } @else if (change.status === 'resubmit_required') {
+                      <small class="version-no invalid">签字已失效</small>
+                    }
+                  </div>
                 </td>
                 <td>
                   <span class="risk" [class]="change.risk">{{ riskLabel(change.risk) }}</span>
@@ -359,6 +365,31 @@ import {
         background: #eaf4f9;
       }
 
+      .status.resubmit_required {
+        border-color: #d0a251;
+        color: #7c5000;
+        background: #fff7e6;
+      }
+
+      .status-cell {
+        display: flex;
+        flex-direction: column;
+        gap: 3px;
+      }
+
+      .version-no {
+        width: fit-content;
+        padding: 1px 6px;
+        background: #edf7f0;
+        color: #286140;
+        font-size: 10px;
+      }
+
+      .version-no.invalid {
+        background: #fbece8;
+        color: #8e260f;
+      }
+
       .status.rejected,
       .status.rolled_back,
       .risk.critical,
@@ -461,8 +492,10 @@ export class DashboardComponent {
       ).length,
   );
 
-  readonly todayWindowCount = computed(() =>
-    this.filteredChanges().filter((change) => change.window.start.startsWith('2026-09-29')).length,
+  readonly todayWindowCount = computed(
+    () =>
+      this.filteredChanges().filter((change) => change.window.start.startsWith('2026-09-29'))
+        .length,
   );
 
   reload(): void {
@@ -476,6 +509,12 @@ export class DashboardComponent {
   issueCount(changeId: string): number {
     const change = this.changes().find((item) => item.id === changeId);
     return change ? validateChange(change, this.changes()).length : 0;
+  }
+
+  activeVersionNo(changeId: string): number | null {
+    const change = this.changes().find((item) => item.id === changeId);
+    const active = change ? getActiveVersion(change) : undefined;
+    return active ? active.version : null;
   }
 
   statusLabel(status: ChangeStatus): string {

@@ -1,6 +1,7 @@
 export type ChangeStatus =
   | 'draft'
   | 'submitted'
+  | 'resubmit_required'
   | 'approved'
   | 'executing'
   | 'completed'
@@ -64,6 +65,42 @@ export interface AuditRecord {
   detail: string;
 }
 
+/** 方案版本状态：会签中 / 有效（已批准）/ 已失效（内容变更后旧签字作废） */
+export type PlanVersionState = 'active' | 'invalidated' | 'superseded';
+
+/** 送审方案的冻结快照：参与对象、窗口与步骤摘要不可变，会签意见随版本保存 */
+export interface PlanVersion {
+  version: number;
+  submittedAt: string;
+  submittedBy: string;
+  /** active：当前有效（会签中或已批准）；invalidated：内容变更导致旧签字失效 */
+  state: PlanVersionState;
+  /** 旧版本失效原因，记录发生变化的摘要区块 */
+  invalidatedAreas: PlanDiffArea[];
+  invalidatedAt?: string;
+  resources: ChangeResource[];
+  window: ChangeWindow;
+  steps: ChangeStep[];
+  approvals: ApprovalRecord[];
+}
+
+/** 参与方案差异比较的摘要区块 */
+export type PlanDiffArea = 'resources' | 'window' | 'steps';
+
+export interface PlanFieldDiff {
+  label: string;
+  before: string;
+  after: string;
+}
+
+export interface PlanVersionDiff {
+  /** 发生变化的区块：参与对象、窗口、步骤摘要 */
+  areas: PlanDiffArea[];
+  resources: PlanFieldDiff[];
+  steps: PlanFieldDiff[];
+  window: PlanFieldDiff[];
+}
+
 export interface ChangeRequest {
   id: string;
   title: string;
@@ -76,6 +113,10 @@ export interface ChangeRequest {
   steps: ChangeStep[];
   window: ChangeWindow;
   approvals: ApprovalRecord[];
+  /** 历次送审版本，索引 0 为最新；执行页只读取 active 版本 */
+  versions: PlanVersion[];
+  /** 正在执行时锁定的版本号，执行勾选只能落在该冻结版本的步骤上 */
+  executingVersion?: number;
   deviations: DeviationRecord[];
   audit: AuditRecord[];
   createdAt: string;
@@ -103,6 +144,7 @@ export const APPROVAL_ORDER: ApprovalStage[] = ['network', 'system', 'security',
 export const STATUS_LABELS: Record<ChangeStatus, string> = {
   draft: '草稿',
   submitted: '待会签',
+  resubmit_required: '待重新提交',
   approved: '已批准',
   executing: '执行中',
   completed: '已完成',
@@ -165,13 +207,13 @@ export function createEmptyChange(): ChangeRequest {
       blackoutProtected: false,
     },
     approvals: createEmptyApprovals(),
+    versions: [],
     deviations: [],
     audit: [],
     createdAt: now.toISOString(),
     updatedAt: now.toISOString(),
   };
 }
-
 export function toLocalInputValue(date: Date): string {
   const offset = date.getTimezoneOffset();
   return new Date(date.getTime() - offset * 60_000).toISOString().slice(0, 16);
@@ -185,7 +227,10 @@ export function isWindowOverlapping(left: ChangeWindow, right: ChangeWindow): bo
   return leftStart < rightEnd && rightStart < leftEnd;
 }
 
-export function validateChange(change: ChangeRequest, allChanges: ChangeRequest[]): ValidationIssue[] {
+export function validateChange(
+  change: ChangeRequest,
+  allChanges: ChangeRequest[],
+): ValidationIssue[] {
   const issues: ValidationIssue[] = [];
   const resourceMap = new Map(change.resources.map((resource) => [resource.id, resource]));
 
@@ -278,16 +323,195 @@ export function validateChange(change: ChangeRequest, allChanges: ChangeRequest[
   return issues;
 }
 
-export function createAudit(
-  action: string,
-  detail: string,
-  actor = '当前用户',
-): AuditRecord {
+export function createAudit(action: string, detail: string, actor = '当前用户'): AuditRecord {
   return {
     id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
     timestamp: new Date().toISOString(),
     actor,
     action,
     detail,
+  };
+}
+
+/* ------------------------------------------------------------------ */
+/* 方案版本：送审冻结快照、签字失效判定与前后差异                        */
+/* ------------------------------------------------------------------ */
+
+export const DIFF_AREA_LABELS: Record<PlanDiffArea, string> = {
+  resources: '参与对象',
+  window: '窗口',
+  steps: '步骤摘要',
+};
+
+/**
+ * 送审时冻结方案快照。执行勾选状态不进入快照内容，
+ * 因此执行中勾选步骤不会让方案指纹发生变化。
+ */
+export function snapshotPlan(
+  change: Pick<ChangeRequest, 'resources' | 'window' | 'steps'>,
+): Pick<PlanVersion, 'resources' | 'window' | 'steps'> {
+  return {
+    resources: change.resources.map((resource) => ({
+      ...resource,
+      dependencies: [...resource.dependencies],
+    })),
+    window: { ...change.window },
+    steps: change.steps.map((step) => ({ ...step })),
+  };
+}
+
+/** 方案变更比较基准：参与对象、窗口与步骤摘要（执行进度不参与） */
+/** 当前有效（正在会签或已批准）的版本；失效版本不能用于执行 */
+export function getActiveVersion(change: ChangeRequest): PlanVersion | undefined {
+  return change.versions.find((version) => version.state === 'active');
+}
+
+/** 执行页只读的版本：优先执行锁定版本，其次当前有效版本 */
+export function getEffectivePlan(change: ChangeRequest): PlanVersion | undefined {
+  if (change.executingVersion) {
+    const locked = change.versions.find((version) => version.version === change.executingVersion);
+    if (locked) {
+      return locked;
+    }
+  }
+  return getActiveVersion(change);
+}
+
+function describeResource(resource: ChangeResource): string {
+  const critical = resource.critical ? '（关键）' : '';
+  const dependencies = resource.dependencies.length
+    ? `，依赖 ${resource.dependencies.join('、')}`
+    : '';
+  return `${RESOURCE_LABELS[resource.type]} ${resource.id} ${resource.name}${critical}${dependencies}`;
+}
+
+function describeStep(step: ChangeStep): string {
+  return `${PHASE_LABELS[step.phase]}｜${step.title}｜责任人 ${step.owner || '未指定'}｜${
+    step.command || '无操作命令'
+  }`;
+}
+
+/** 计算两个方案快照的前后差异；无差异时 areas 为空数组 */
+export function diffPlanVersions(
+  before: Pick<ChangeRequest, 'resources' | 'window' | 'steps'>,
+  after: Pick<ChangeRequest, 'resources' | 'window' | 'steps'>,
+): PlanVersionDiff {
+  const diff: PlanVersionDiff = { areas: [], resources: [], steps: [], window: [] };
+
+  const beforeResources = new Map(before.resources.map((resource) => [resource.id, resource]));
+  const afterResources = new Map(after.resources.map((resource) => [resource.id, resource]));
+
+  before.resources.forEach((resource) => {
+    if (!afterResources.has(resource.id)) {
+      diff.resources.push({
+        label: `移除参与对象 ${resource.id}`,
+        before: describeResource(resource),
+        after: '—',
+      });
+    }
+  });
+  after.resources.forEach((resource) => {
+    const previous = beforeResources.get(resource.id);
+    if (!previous) {
+      diff.resources.push({
+        label: `新增参与对象 ${resource.id}`,
+        before: '—',
+        after: describeResource(resource),
+      });
+    } else if (describeResource(previous) !== describeResource(resource)) {
+      diff.resources.push({
+        label: `修改参与对象 ${resource.id}`,
+        before: describeResource(previous),
+        after: describeResource(resource),
+      });
+    }
+  });
+
+  const beforeSteps = new Map(before.steps.map((step) => [step.id, step]));
+  const afterSteps = new Map(after.steps.map((step) => [step.id, step]));
+
+  before.steps.forEach((step) => {
+    if (!afterSteps.has(step.id)) {
+      diff.steps.push({ label: `移除步骤 ${step.title}`, before: describeStep(step), after: '—' });
+    }
+  });
+  after.steps.forEach((step) => {
+    const previous = beforeSteps.get(step.id);
+    if (!previous) {
+      diff.steps.push({ label: `新增步骤 ${step.title}`, before: '—', after: describeStep(step) });
+    } else if (describeStep(previous) !== describeStep(step)) {
+      diff.steps.push({
+        label: `修改步骤 ${step.title}`,
+        before: describeStep(previous),
+        after: describeStep(step),
+      });
+    }
+  });
+
+  const windowFields: PlanFieldDiff[] = [];
+  if (before.window.start !== after.window.start) {
+    windowFields.push({
+      label: '窗口开始',
+      before: before.window.start,
+      after: after.window.start,
+    });
+  }
+  if (before.window.end !== after.window.end) {
+    windowFields.push({ label: '窗口结束', before: before.window.end, after: after.window.end });
+  }
+  if (before.window.observationWindowMinutes !== after.window.observationWindowMinutes) {
+    windowFields.push({
+      label: '观察窗口（分钟）',
+      before: String(before.window.observationWindowMinutes),
+      after: String(after.window.observationWindowMinutes),
+    });
+  }
+  diff.window = windowFields;
+
+  if (diff.resources.length) {
+    diff.areas.push('resources');
+  }
+  if (diff.window.length) {
+    diff.areas.push('window');
+  }
+  if (diff.steps.length) {
+    diff.areas.push('steps');
+  }
+  return diff;
+}
+
+/**
+ * 兼容旧数据：为没有版本记录的历史变更按当前状态补建冻结版本。
+ * 已进入执行或终态的记录，旧签字随版本冻结保留。
+ */
+export function normalizeChange(change: ChangeRequest): ChangeRequest {
+  if (change.versions?.length) {
+    return change;
+  }
+
+  const needsVersion = !['draft'].includes(change.status);
+  if (!needsVersion) {
+    return { ...change, versions: [] };
+  }
+
+  const state: PlanVersionState =
+    change.status === 'submitted' || change.status === 'approved' ? 'active' : 'superseded';
+  const version: PlanVersion = {
+    version: 1,
+    submittedAt: change.createdAt,
+    submittedBy: change.owner,
+    state,
+    invalidatedAreas: [],
+    ...snapshotPlan(change),
+    approvals: change.approvals.map((approval) => ({ ...approval })),
+  };
+  const executionLocked =
+    change.status === 'executing' ||
+    change.status === 'completed' ||
+    change.status === 'rolled_back';
+  return {
+    ...change,
+    versions: [version],
+    executingVersion: executionLocked ? 1 : change.executingVersion,
   };
 }
